@@ -11,8 +11,8 @@ A Google Apps Script runs on a daily trigger, fetches hourly HRRR wind forecasts
 ```
 paragliding_forecast/
 ├── paragliding_forecast.js        # Google Apps Script (copy into your project)
-├── paragliding_forecast.js.bak    # Backup of the original script
 ├── README.md
+├── SETUP.md                       # Deployment details for this instance
 └── open-meteo-proxy/              # Cloudflare Worker proxy
     ├── package.json
     ├── wrangler.toml
