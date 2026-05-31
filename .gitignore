@@ -1,0 +1,6 @@
+# Cloudflare / Wrangler
+open-meteo-proxy/node_modules/
+open-meteo-proxy/.wrangler/
+
+# macOS
+.DS_Store

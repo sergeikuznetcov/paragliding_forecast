@@ -1,0 +1,297 @@
+/**
+ * BAY AREA PARAGLIDING - FLYABLE ONLY VERSION
+ *
+ * Sends a daily email when flyable wind windows exist in the next day or two.
+ *
+ * NOTE: Also set the project timezone in appsscript.json for clean subject lines:
+ *   "timeZone": "America/Los_Angeles"
+ * (The time logic below no longer depends on it, but it's good hygiene.)
+ */
+
+const CONFIG = {
+    RECIPIENT_EMAILS: ["sergeismth@gmail.com"],
+    // RECIPIENT_EMAILS: ["sergeismth@gmail.com", "iboris@gmail.com"],
+    TIMEZONE: "America/Los_Angeles",
+
+    // Cloudflare Worker proxy URL — avoids Google's shared-IP rate limits on Open-Meteo.
+    // Replace with your deployed Worker URL, e.g. "https://open-meteo-proxy.<you>.workers.dev"
+    // Set to "https://api.open-meteo.com" to call Open-Meteo directly (may hit 429s from Apps Script).
+    WEATHER_API_BASE: "https://open-meteo-proxy.paragliding-forecast.workers.dev",
+
+    // Flip to true to log WHY each non-flyable hour was rejected. Leave false in production.
+    DEBUG: false,
+
+    // Global defaults. Any of these can be overridden per-site in SITES below.
+    DEFAULTS: {
+        minSpd: 8,        // mph
+        maxSpd: 15,       // mph
+        gustSpread: 8,    // (gust - speed) above this = too punchy
+        hourStart: 9,     // earliest hour to consider (local)
+        hourEnd: 18       // latest hour to consider (local) — bump to 20 for summer glass-off
+    },
+
+    SITES: [
+        {
+            name: "Mussel Rock",
+            lat: 37.67, lon: -122.49,
+            minDir: 225, maxDir: 330,
+            link: "https://www.windy.com/37.670/-122.490/hrrrConus?hrrrConus,37.670,-122.490,11",
+            nav: "https://www.google.com/maps/dir/?api=1&destination=37.66622270730809, -122.4948722936037"
+        },
+        // {
+        //     name: "Blue Rock",
+        //     lat: 38.1379, lon: -122.195,
+        //     minDir: 210, maxDir: 300,
+        //     link: "https://www.windy.com/38.138/-122.195/hrrrConus?hrrrConus,38.138,-122.195,11",
+        //     nav: "https://www.google.com/maps/dir/?api=1&destination=38.13594093650429, -122.20438964492259"
+        // },
+        // {
+        //     name: "Ed Levin (1750ft)",
+        //     lat: 37.4754, lon: -121.8613,
+        //     minDir: 210, maxDir: 300,
+        //     link: "https://www.windy.com/37.475/-121.861/hrrrConus?hrrrConus,37.475,-121.861,11",
+        //     nav: "https://www.google.com/maps/dir/?api=1&destination=37.456672457310844, -121.86590664401301"
+        // },
+        // {
+        //     name: "Ed Levin (600ft)",
+        //     lat: 37.4615, lon: -121.8645,
+        //     minDir: 210, maxDir: 300,
+        //     link: "https://www.windy.com/37.461/-121.864/hrrrConus?hrrrConus,37.461,-121.864,11",
+        //     nav: "https://www.google.com/maps/dir/?api=1&destination=37.456672457310844, -121.86590664401301"
+        // }
+    ]
+};
+
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/** Merge global defaults with a site's own overrides. */
+function resolveSite(site) {
+    return Object.assign({}, CONFIG.DEFAULTS, site);
+}
+
+/** Fetch with retry and exponential backoff for transient 429s. */
+function fetchWithRetry(url, maxRetries = 4) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        const response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+        const code = response.getResponseCode();
+        if (code === 200) return response;
+        if (code === 429 && attempt < maxRetries) {
+            const delaySec = Math.pow(2, attempt) * 2;   // 2s, 4s, 8s, 16s
+            console.log(`429 on attempt ${attempt + 1}, retrying in ${delaySec}s…`);
+            Utilities.sleep(delaySec * 1000);
+            continue;
+        }
+        // Non-retryable error or final attempt — return as-is for caller to handle
+        return response;
+    }
+}
+
+/** Converts degrees to cardinal direction letters. */
+function getCardinalDirection(angle) {
+    const directions = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+    const index = Math.round(angle / 22.5) % 16;
+    return directions[index];
+}
+
+/**
+ * Weekday name from a bare ISO date string ("2026-05-30T11:00"), independent of
+ * any runtime timezone — we treat the date portion as a pure calendar date.
+ */
+function weekdayFromISO(iso) {
+    const [y, m, d] = iso.substring(0, 10).split('-').map(Number);
+    return WEEKDAYS[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+}
+
+/** "11 AM" / "02 PM" from a bare ISO string — also timezone-independent. */
+function hourLabel(iso) {
+    const hr = parseInt(iso.substring(11, 13), 10);
+    const ampm = hr >= 12 ? 'PM' : 'AM';
+    const h12 = hr % 12 === 0 ? 12 : hr % 12;
+    return `${String(h12).padStart(2, '0')} ${ampm}`;
+}
+
+/**
+ * Evaluates one hour against a site's criteria.
+ * Returns the individual gate results so DEBUG mode can explain rejections.
+ * Direction check handles wraparound across 0/360 (e.g. minDir 330, maxDir 30).
+ */
+function evaluate(cfg, speed, dir, gust) {
+    const dirMatch = cfg.minDir <= cfg.maxDir
+        ? (dir >= cfg.minDir && dir <= cfg.maxDir)
+        : (dir >= cfg.minDir || dir <= cfg.maxDir);
+    const speedMatch = speed >= cfg.minSpd && speed <= cfg.maxSpd;
+    const punchy = gust != null && (gust - speed) > cfg.gustSpread;
+
+    return {
+        flyable: dirMatch && speedMatch && !punchy,
+        dirMatch, speedMatch, punchy
+    };
+}
+
+function dailyParaglidingReport() {
+    try {
+        runReport();
+    } catch (e) {
+        // Catastrophic failure — make it loud instead of silent.
+        console.error("Paragliding report failed: " + (e.stack || e));
+        try {
+            MailApp.sendEmail({
+                to: CONFIG.RECIPIENT_EMAILS[0],
+                subject: "⚠️ Paragliding report failed",
+                body: "The daily run threw an error:\n\n" + (e.stack || e)
+            });
+        } catch (_) { /* nothing more we can do */ }
+    }
+}
+
+function runReport() {
+    let emailHtml = `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: auto; border: 1px solid #e1e4e8; border-radius: 12px; overflow: hidden; background-color: #ffffff; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">
+                    <div style="background: #2c3e50; padding: 25px 20px; text-align: center; color: white;">
+                      <h2 style="margin: 0; font-size: 22px; text-transform: uppercase; letter-spacing: 2px;">Flyable Windows</h2>
+                      <p style="margin: 6px 0 0; font-size: 13px; opacity: 0.8;">HRRR High-Res Model</p>
+                    </div>`;
+    let flyableDataFound = false;
+
+    // Timezone-safe "now": a local LA wall-clock string. Because Open-Meteo returns
+    // bare local strings ("2026-05-30T11:00") that sort lexicographically, we can
+    // compare them directly instead of round-tripping through Date (which is what
+    // was silently dropping near-term windows when the project TZ wasn't LA).
+    const nowLA = Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "yyyy-MM-dd'T'HH:mm");
+
+    CONFIG.SITES.forEach(rawSite => {
+        const cfg = resolveSite(rawSite);
+        try {
+            const url = `${CONFIG.WEATHER_API_BASE}/v1/forecast?latitude=${cfg.lat}&longitude=${cfg.lon}&hourly=wind_speed_10m,wind_direction_10m,wind_gusts_10m&models=gfs_hrrr&wind_speed_unit=mph&timezone=America%2FLos_Angeles`;
+            const response = fetchWithRetry(url);
+
+            if (!response || response.getResponseCode() !== 200) {
+                const code = response ? response.getResponseCode() : 'no response';
+                const body = response ? response.getContentText().slice(0, 200) : '';
+                console.error(`${cfg.name}: HTTP ${code} — ${body}`);
+                return;
+            }
+
+            const data = JSON.parse(response.getContentText());
+            const h = data.hourly;
+            if (!h) {
+                console.error(`No hourly data returned for ${cfg.name}. Response: ${response.getContentText().slice(0, 200)}`);
+                return;
+            }
+
+            // Single-model requests usually return unsuffixed keys; the suffixed
+            // variants are kept as a fallback for multi-model responses.
+            const speedArr = h.wind_speed_10m_gfs_hrrr || h.wind_speed_10m;
+            const dirArr = h.wind_direction_10m_gfs_hrrr || h.wind_direction_10m;
+            const gustArr = h.wind_gusts_10m_gfs_hrrr || h.wind_gusts_10m || [];
+
+            if (!speedArr || !dirArr) {
+                console.error(`Weather arrays are missing for ${cfg.name}`);
+                return;
+            }
+
+            let siteRows = "";
+            let appendixRows = "";
+            let lastFlyableDay = "";
+            let lastAppendixDay = "";
+
+            for (let i = 0; i < h.time.length; i++) {
+                const iso = h.time[i];
+                if (iso < nowLA) continue;                                   // past hours (TZ-safe)
+                if (speedArr[i] === null || dirArr[i] === null) continue;    // missing data
+
+                const hour = parseInt(iso.substring(11, 13), 10);
+                if (hour < cfg.hourStart || hour > cfg.hourEnd) continue;    // outside flyable hours
+
+                const currentDay = weekdayFromISO(iso);
+                const timeStr = hourLabel(iso);
+                const cardinal = getCardinalDirection(dirArr[i]);
+                const spd = Math.round(speedArr[i]);
+                const gst = gustArr[i] == null ? null : Math.round(gustArr[i]);
+                const gstLabel = gst == null ? '—' : gst;
+
+                // Evaluate on the rounded/displayed values so the email never shows
+                // numbers that "look flyable" but were rejected on raw decimals.
+                const ev = evaluate(cfg, spd, dirArr[i], gst);
+
+                if (CONFIG.DEBUG && !ev.flyable) {
+                    console.log(`${cfg.name} ${iso}: spd=${spd} dir=${dirArr[i]}° gust=${gstLabel} → ` +
+                        `dir:${ev.dirMatch ? '✓' : '✗'} spd:${ev.speedMatch ? '✓' : '✗'} punchy:${ev.punchy ? '✓' : '✗'}`);
+                }
+
+                if (ev.flyable) {
+                    flyableDataFound = true;
+                    if (currentDay !== lastFlyableDay) {
+                        siteRows += `<tr><td colspan="3" style="padding: 12px 15px; background: #fdfdfd; font-size: 11px; font-weight: bold; color: #95a5a6; text-transform: uppercase; border-bottom: 1px solid #f0f2f5;">${currentDay}</td></tr>`;
+                        lastFlyableDay = currentDay;
+                    }
+                    siteRows += `
+                        <tr style="border-bottom: 1px solid #f0f2f5;">
+                            <td style="padding: 15px; font-weight: bold; color: #2c3e50; font-size: 14px; width: 65px; white-space: nowrap;">${timeStr}</td>
+                            <td style="padding: 15px 5px; color: #28a745; font-weight: bold; font-size: 14px; text-align: left; white-space: nowrap;">
+                            FLYABLE
+                            </td>
+                            <td style="padding: 15px; text-align: right; white-space: nowrap;">
+                                <span style="font-size: 17px; font-weight: bold; color: #2c3e50;">${spd}</span>
+                                <span style="font-size: 11px; color:#999; margin-left: 2px;">(G:${gstLabel})</span>
+                                <span style="margin: 0 4px; color: #eee; font-size: 16px;">|</span>
+                                <span style="font-size: 15px; font-weight: bold; color: #2c3e50; min-width: 35px; display: inline-block;">${cardinal}</span>
+                            </td>
+                        </tr>`;
+                }
+
+                if (currentDay !== lastAppendixDay) {
+                    appendixRows += `<tr><td colspan="3" style="padding: 10px 15px 4px; font-size: 10px; color: #bdc3c7; font-weight: bold; text-transform: uppercase;">${currentDay}</td></tr>`;
+                    lastAppendixDay = currentDay;
+                }
+                appendixRows += `
+                    <tr style="font-size: 12px; color: #7f8c8d;">
+                        <td style="padding: 4px 15px; width: 75px;">${timeStr}</td>
+                        <td style="padding: 4px 0;">${spd} mph <span style="font-size: 10px; color: #bdc3c7;">(G:${gstLabel})</span></td>
+                        <td style="padding: 4px 15px; text-align: right; font-weight: 500;">${cardinal} <span style="font-size: 10px; color: #bdc3c7; font-weight: normal;">(${dirArr[i]}°)</span></td>
+                    </tr>`;
+            }
+
+            if (siteRows || appendixRows) {
+                emailHtml += `
+                <div style="margin: 20px; border: 1px solid #ebeef2; border-radius: 10px; overflow: hidden; background-color: #ffffff;">
+                  <table style="width: 100%; border-collapse: collapse; background: #f8f9fb; border-bottom: 1px solid #ebeef2;">
+                    <tr>
+                      <td style="padding: 15px; text-align: left; vertical-align: middle;">
+                        <a href="${cfg.nav}" style="text-decoration: none; font-size: 18px; margin-right: 8px; vertical-align: middle;">📍</a>
+                        <span style="font-size: 16px; font-weight: bold; color: #1a202c; vertical-align: middle;">${cfg.name}</span>
+                      </td>
+                      <td style="padding: 15px; text-align: right; vertical-align: middle; width: 90px;">
+                        <a href="${cfg.link}" style="background: #3498db; color: #ffffff; text-decoration: none; font-size: 10px; padding: 6px 12px; border-radius: 6px; font-weight: 600; text-transform: uppercase; white-space: nowrap;">Windy</a>
+                      </td>
+                    </tr>
+                  </table>
+
+                  <table style="width: 100%; border-collapse: collapse;">
+                    ${siteRows || '<tr><td colspan="3" style="padding: 30px; text-align: center; color: #cbd5e0; font-size: 14px; font-style: italic;">No ideal windows found.</td></tr>'}
+                  </table>
+
+                  <div style="background: #fafbfc; padding-bottom: 15px; border-top: 1px solid #f0f2f5;">
+                    <p style="margin: 15px 15px 10px; font-size: 10px; font-weight: bold; color: #a0aec0; text-transform: uppercase; letter-spacing: 1px;">Full Hourly Forecast</p>
+                    <table style="width: 100%; border-collapse: collapse;">${appendixRows}</table>
+                  </div>
+                </div>`;
+            }
+        } catch (e) {
+            console.error(`Error processing ${cfg.name}: ` + (e.stack || e));
+        }
+    });
+
+    emailHtml += `<div style="padding: 30px 20px; text-align: center; color: #a0aec0; font-size: 12px; background: #f8f9fb; border-top: 1px solid #edf2f7;">Check conditions on launch. Safe landings!</div></div>`;
+
+    if (flyableDataFound) {
+        console.log("Flyable: sending email");
+        MailApp.sendEmail({
+            name: "Paragliding Forecast",
+            bcc: CONFIG.RECIPIENT_EMAILS.join(","),
+            subject: `🪂 Flying Report: ${Utilities.formatDate(new Date(), CONFIG.TIMEZONE, "MMM d")}`,
+            htmlBody: emailHtml
+        });
+    } else {
+        console.log("Not flyable: skipping email");
+    }
+}
