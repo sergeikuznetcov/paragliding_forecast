@@ -5,7 +5,7 @@
 - **Worker name:** `open-meteo-proxy`
 - **URL:** `https://open-meteo-proxy.paragliding-forecast.workers.dev`
 - **Account subdomain:** `paragliding-forecast.workers.dev`
-- **Cloudflare dashboard:** [dash.cloudflare.com](https://dash.cloudflare.com/5a518aca4d53ff82139a25fdf299df1f/workers/subdomain)
+- **Cloudflare dashboard:** [dash.cloudflare.com](https://dash.cloudflare.com) → Workers & Pages → open-meteo-proxy
 - **Wrangler version used to deploy:** 3.114.17
 
 The worker forwards GET requests to `api.open-meteo.com`, caches responses for 30 minutes at the edge, and adds CORS headers.
@@ -19,7 +19,7 @@ npx wrangler deploy
 ## Google Apps Script
 
 - **File:** `paragliding_forecast.js`
-- **Recipient:** `sergeismth@gmail.com`
+- **Recipient:** your email (set in `RECIPIENT_EMAILS` in the script)
 - **Timezone:** `America/Los_Angeles`
 - **`WEATHER_API_BASE`:** `https://open-meteo-proxy.paragliding-forecast.workers.dev`
 

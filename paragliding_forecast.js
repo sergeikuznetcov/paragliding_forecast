@@ -9,8 +9,8 @@
  */
 
 const CONFIG = {
-    RECIPIENT_EMAILS: ["sergeismth@gmail.com"],
-    // RECIPIENT_EMAILS: ["sergeismth@gmail.com", "iboris@gmail.com"],
+    RECIPIENT_EMAILS: ["your@email.com"],
+    // RECIPIENT_EMAILS: ["your@email.com", "friend@email.com"],
     TIMEZONE: "America/Los_Angeles",
 
     // Cloudflare Worker proxy URL — avoids Google's shared-IP rate limits on Open-Meteo.
